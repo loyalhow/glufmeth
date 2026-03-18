@@ -6,6 +6,7 @@ from zipfile import ZipFile
 
 gcmeta_path = Path("c:/Users/loyal/Documents/trae_projects/Phosphorus-cycling-database/gcMeta_output/metainformation/merged_meta_information.tsv")
 smag_xlsx_path = Path("c:/Users/loyal/Documents/trae_projects/Phosphorus-cycling-database/SMAG_output/Supplementary Data 1.xlsx")
+lucas_path = Path("c:/Users/loyal/Documents/trae_projects/Phosphorus-cycling-database/LUCAS/LUCAS_metainfo.csv")
 output_path = Path("c:/Users/loyal/Documents/trae_projects/Phosphorus-cycling-database/gcMeta_output/metainformation/global_sample_locations_fancy.html")
 
 
@@ -15,6 +16,27 @@ def col_to_index(ref: str) -> int:
     for ch in letters:
         idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
     return idx - 1
+
+
+def parse_lat_lon(lat_lon_str: str) -> tuple[float | None, float | None]:
+    """Parse coordinate format like '53.1515 N 7.1139 E' into (lat, lon) floats."""
+    try:
+        parts = lat_lon_str.strip().split()
+        if len(parts) != 4:
+            return None, None
+        lat_val = float(parts[0])
+        lat_dir = parts[1].upper()
+        lon_val = float(parts[2])
+        lon_dir = parts[3].upper()
+        
+        if lat_dir == "S":
+            lat_val = -lat_val
+        if lon_dir == "W":
+            lon_val = -lon_val
+        
+        return lat_val, lon_val
+    except (ValueError, IndexError):
+        return None, None
 
 
 def read_xlsx_rows(xlsx_path: Path, sheet_index: int = 0):
@@ -59,6 +81,7 @@ groups = {}
 legend_groups = set()
 gcmeta_valid_rows = 0
 smag_valid_rows = 0
+lucas_valid_rows = 0
 sample_points = []
 
 with gcmeta_path.open("r", encoding="utf-8", newline="") as f:
@@ -144,6 +167,65 @@ if header_idx is not None:
         groups[key]["biosamples"].add(sample)
         legend_groups.add(group_label)
 
+# LUCAS land use classification mapping
+# Update this dictionary with your actual sample ID to land use mapping
+lucas_land_use_map = {
+    # Format: "Sample_Name": "Land Use Category",
+    # Categories:
+    # - Annual croplands
+    # - Permanent croplands
+    # - Former croplands converted to grasslands
+    # - Extensive grasslands
+    # - Woodlands
+}
+
+# Process LUCAS dataset
+with lucas_path.open("r", encoding="utf-8", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        lat_lon_str = row.get("lat_lon", "")
+        if not lat_lon_str:
+            continue
+        lat, lon = parse_lat_lon(lat_lon_str)
+        if lat is None or lon is None:
+            continue
+        lucas_valid_rows += 1
+        sample_points.append({"lat": lat, "lon": lon, "source": "LUCAS"})
+        country = row.get("geo_loc_name_country", "Unknown").strip()
+        sample_name = row.get("Sample Name", "").strip()
+        
+        # Get land use type from mapping or default to "Unknown"
+        land_use = lucas_land_use_map.get(sample_name, "Unknown")
+        if land_use == "Unknown":
+            # Fallback: try to infer from env_local_scale if available
+            env_local = row.get("env_local_scale", "")
+            if "01000245" in env_local:  # ENVO for agricultural land
+                land_use = "Croplands"
+            elif "01000177" in env_local:  # ENVO for Mediterranean region
+                land_use = "Grasslands"
+            elif "01000196" in env_local:  # ENVO for boreal forest/taiga
+                land_use = "Woodlands"
+            elif "01000197" in env_local:  # ENVO for temperate broadleaf forest
+                land_use = "Woodlands"
+        
+        group_label = f"LUCAS | {land_use}"
+        key = (lat, lon, group_label, country, "LUCAS")
+        if key not in groups:
+            groups[key] = {
+                "lat": lat,
+                "lon": lon,
+                "group": group_label,
+                "country": country,
+                "source": "LUCAS",
+                "count": 0,
+                "biosamples": set(),
+                "completeness_sum": 0.0,
+                "contamination_sum": 0.0,
+            }
+        groups[key]["count"] += 1
+        groups[key]["biosamples"].add(sample_name)
+        legend_groups.add(group_label)
+
 points = []
 for item in groups.values():
     count = item["count"]
@@ -190,7 +272,7 @@ html = f"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Global gcMeta + SMAG Sample Locations</title>
+  <title>Global gcMeta + SMAG + LUCAS Sample Locations</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
@@ -268,7 +350,7 @@ html = f"""<!DOCTYPE html>
 <body>
   <div class="header">
     <div>
-      <div class="title">Global Distribution of gcMeta + SMAG Sampling Points</div>
+      <div class="title">Global Distribution of gcMeta + SMAG + LUCAS Sampling Points</div>
       <div class="subtitle">Marker radius scales with record count at each location</div>
     </div>
     <div id="legend" class="legend"></div>
@@ -362,8 +444,41 @@ html = f"""<!DOCTYPE html>
 
 output_path.write_text(html, encoding="utf-8")
 
-print(f"Saved: {output_path}")
-print(f"gcMeta rows with valid coordinates: {gcmeta_valid_rows}")
-print(f"SMAG rows with valid coordinates: {smag_valid_rows}")
-print(f"Total raw sampling points plotted: {len(sample_points)}")
-print(f"Plotted aggregated points: {len(points)}")
+# Calculate detailed statistics
+from collections import defaultdict
+
+stats = {
+    "gcMeta": {"total": gcmeta_valid_rows, "countries": set(), "ecosystems": set(), "coordinates": set()},
+    "SMAG": {"total": smag_valid_rows, "countries": set(), "ecosystems": set(), "coordinates": set()},
+    "LUCAS": {"total": lucas_valid_rows, "countries": set(), "ecosystems": set(), "coordinates": set()},
+    "combined": {"total": len(sample_points), "countries": set(), "ecosystems": set(), "coordinates": set()}
+}
+
+for item in groups.values():
+    source = item["source"]
+    lat_lon = (round(item["lat"], 4), round(item["lon"], 4))
+    stats[source]["countries"].add(item["country"])
+    stats[source]["ecosystems"].add(item["group"].split(" | ", 1)[1])
+    stats[source]["coordinates"].add(lat_lon)
+    stats["combined"]["countries"].add(item["country"])
+    stats["combined"]["ecosystems"].add(item["group"])
+    stats["combined"]["coordinates"].add(lat_lon)
+
+# Print statistics
+print("\n" + "="*80)
+print("GLOBAL SAMPLING SITES STATISTICS")
+print("="*80)
+
+for dataset in ["gcMeta", "SMAG", "LUCAS", "combined"]:
+    print(f"\n📊 {dataset.upper()} DATASET:")
+    print(f"  Total raw samples: {stats[dataset]['total']:,}")
+    print(f"  Unique coordinates: {len(stats[dataset]['coordinates']):,}")
+    print(f"  Countries/regions covered: {len(stats[dataset]['countries'])}")
+    print(f"  Ecosystem types: {len(stats[dataset]['ecosystems'])}")
+    
+    if dataset != "combined":
+        print(f"  Ecosystem list: {', '.join(sorted(stats[dataset]['ecosystems']))}")
+
+print(f"\n🌍 AGGREGATED MAP POINTS: {len(points):,}")
+print(f"💾 Map saved to: {output_path}")
+print("="*80 + "\n")
